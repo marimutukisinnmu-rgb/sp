@@ -145,7 +145,7 @@ def play_visualizer(features: dict[str, np.ndarray], title: str) -> None:
         ax.set_xlim(0, max(float(times[-1]), 1.0))
         return tuple(lines.values())
 
-    FuncAnimation(fig, update, interval=50, blit=False, cache_frame_data=False)
+    animation = FuncAnimation(fig, update, interval=50, blit=False, cache_frame_data=False)
     plt.show()
 
 
