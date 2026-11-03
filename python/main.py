@@ -1,173 +1,189 @@
-"""
-SP - audio part visualizer (Python prototype)
+"""SP MP3 stem splitter.
 
-Read-only input support:
-  - Audio: WAV / MP3
-  - Video: MP4 / WebM (audio is decoded to memory for analysis; source is untouched)
-
-This first prototype estimates Bass and Percussion using signal features.
-Piano and Vocal are heuristic estimates, not reliable source separation.
+The input MP3 is read only. Demucs writes its intermediate files into a
+temporary directory inside the selected output directory; only the four
+finished MP3 stems are kept.
 """
 from __future__ import annotations
 
 import argparse
-import math
+import os
+import shutil
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
-import numpy as np
-import soundfile as sf
-import librosa
-import matplotlib.pyplot as plt
 
-plt.rcParams["font.family"] = ["Yu Gothic", "Meiryo", "sans-serif"]
-from matplotlib.animation import FuncAnimation
-
-AUDIO_EXTENSIONS = {".wav", ".mp3"}
-VIDEO_EXTENSIONS = {".mp4", ".webm"}
-SUPPORTED_EXTENSIONS = AUDIO_EXTENSIONS | VIDEO_EXTENSIONS
+STEMS = {
+    "bass": "Bass.mp3",
+    "drums": "Perc.mp3",
+    "other": "MIEP.mp3",
+    "vocals": "Vocals.mp3",
+}
 
 
-def load_audio_read_only(path: Path, sample_rate: int = 22050) -> tuple[np.ndarray, int]:
-    """Decode audio into memory only. Never writes to or modifies the input file."""
-    suffix = path.suffix.lower()
-    if suffix not in SUPPORTED_EXTENSIONS:
-        raise ValueError(f"Unsupported file type: {suffix}")
-
-    if suffix in VIDEO_EXTENSIONS:
-        try:
-            import imageio_ffmpeg
-        except ImportError as exc:
-            raise RuntimeError(
-                "Video support requires imageio-ffmpeg. Install requirements.txt."
-            ) from exc
-
-        # ffmpeg reads the video and emits decoded PCM to stdout. No output file is made.
-        import subprocess
-
-        command = [
-            imageio_ffmpeg.get_ffmpeg_exe(),
-            "-v", "error",
-            "-i", str(path),
-            "-vn",
-            "-f", "f32le",
-            "-acodec", "pcm_f32le",
-            "-ac", "1",
-            "-ar", str(sample_rate),
-            "pipe:1",
-        ]
-        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-        if result.returncode != 0 or not result.stdout:
-            message = result.stderr.decode("utf-8", errors="replace").strip()
-            raise RuntimeError(f"Could not decode video audio: {message or 'no audio stream'}")
-        audio = np.frombuffer(result.stdout, dtype=np.float32).copy()
-        return audio, sample_rate
-
-    audio, sr = sf.read(str(path), dtype="float32", always_2d=False)
-    if audio.ndim == 2:
-        audio = np.mean(audio, axis=1)
-    if sr != sample_rate:
-        audio = librosa.resample(audio, orig_sr=sr, target_sr=sample_rate)
-        sr = sample_rate
-    return np.asarray(audio, dtype=np.float32), sr
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Separate an MP3 into Bass, Perc, MIEP, and Vocals files."
+    )
+    parser.add_argument("input", type=Path, help="Input MP3 file (read only)")
+    parser.add_argument(
+        "-o",
+        "--output-dir",
+        type=Path,
+        required=True,
+        help="Directory where the four separated MP3 files will be saved",
+    )
+    parser.add_argument(
+        "--device",
+        choices=("cpu", "cuda"),
+        default="cpu",
+        help="Processing device (default: cpu; use cuda only if supported)",
+    )
+    parser.add_argument(
+        "--mp3-bitrate",
+        type=int,
+        choices=(128, 192, 256, 320),
+        default=320,
+        help="Output MP3 bitrate in kbps (default: 320)",
+    )
+    return parser.parse_args()
 
 
-def normalize(values: np.ndarray) -> np.ndarray:
-    peak = float(np.max(values)) if values.size else 0.0
-    if peak <= 1e-12:
-        return np.zeros_like(values, dtype=np.float32)
-    return np.clip(values / peak, 0.0, 1.0).astype(np.float32)
+def separate_mp3(
+    input_path: Path,
+    output_dir: Path,
+    device: str,
+    mp3_bitrate: int,
+) -> int:
+    input_path = input_path.expanduser().resolve()
+    output_dir = output_dir.expanduser().resolve()
 
+    if not input_path.is_file():
+        print(f"Error: input file does not exist: {input_path}", file=sys.stderr)
+        return 2
+    if input_path.suffix.lower() != ".mp3":
+        print("Error: input must be an MP3 file.", file=sys.stderr)
+        return 2
 
-def analyze(audio: np.ndarray, sr: int, hop_length: int = 512) -> dict[str, np.ndarray]:
-    if audio.size == 0:
-        raise ValueError("The selected file contains no audio.")
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    n_fft = 2048
-    stft = librosa.stft(audio, n_fft=n_fft, hop_length=hop_length)
-    magnitude = np.abs(stft)
-    frequencies = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+    # Never overwrite existing results.
+    conflicts = [name for name in STEMS.values() if (output_dir / name).exists()]
+    if conflicts:
+        print(
+            "Error: these output files already exist; nothing was overwritten:\n"
+            + "\n".join(f"  {name}" for name in conflicts),
+            file=sys.stderr,
+        )
+        return 2
 
-    def band_energy(low: float, high: float) -> np.ndarray:
-        mask = (frequencies >= low) & (frequencies < high)
-        if not np.any(mask):
-            return np.zeros(magnitude.shape[1], dtype=np.float32)
-        return np.sqrt(np.mean(magnitude[mask] ** 2, axis=0))
+    print(f"Input (read only): {input_path}")
+    print(f"Output directory: {output_dir}")
+    print("Starting Demucs. The first run may download its model.")
 
-    bass = normalize(band_energy(35, 180))
-    low_mid = band_energy(180, 2000)
-    high_mid = band_energy(2000, 8000)
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix=".sp-demucs-", dir=str(output_dir)
+        ) as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            demucs_output = temporary_path / "demucs"
 
-    # Percussion proxy: positive spectral-flux changes, weighted toward upper frequencies.
-    flux = librosa.onset.onset_strength(S=librosa.amplitude_to_db(magnitude + 1e-8), sr=sr, hop_length=hop_length)
-    flux = librosa.util.fix_length(flux, size=magnitude.shape[1])
-    perc = normalize(flux * (0.35 + normalize(high_mid)))
+            command = [
+                sys.executable,
+                "-m",
+                "demucs",
+                "-n",
+                "htdemucs",
+                "--mp3",
+                "--mp3-bitrate",
+                str(mp3_bitrate),
+                "-d",
+                device,
+                "-o",
+                str(demucs_output),
+                str(input_path),
+            ]
 
-    # Lightweight heuristics only. These are not instrument classifiers.
-    centroid = librosa.feature.spectral_centroid(S=magnitude, sr=sr)[0]
-    flatness = librosa.feature.spectral_flatness(S=magnitude)[0]
-    harmonic = librosa.effects.harmonic(audio)
-    harmonic_rms = librosa.feature.rms(y=harmonic, frame_length=n_fft, hop_length=hop_length)[0]
-    harmonic_rms = librosa.util.fix_length(harmonic_rms, size=magnitude.shape[1])
+            result = subprocess.run(command, check=False)
+            if result.returncode != 0:
+                print(
+                    f"Error: Demucs exited with code {result.returncode}.",
+                    file=sys.stderr,
+                )
+                print(
+                    "Install dependencies with: "
+                    "python -m pip install -r requirements.txt",
+                    file=sys.stderr,
+                )
+                return result.returncode or 1
 
-    piano = normalize(harmonic_rms * (1.0 - np.clip(flatness, 0, 1)))
-    vocal_likeness = np.exp(-((centroid - 2200.0) / 1800.0) ** 2) * (1.0 - np.clip(flatness, 0, 1))
-    vocal = normalize(vocal_likeness * np.sqrt(low_mid + high_mid + 1e-8))
+            model_directory = demucs_output / "htdemucs"
+            song_directories = (
+                [path for path in model_directory.iterdir() if path.is_dir()]
+                if model_directory.is_dir()
+                else []
+            )
+            if len(song_directories) != 1:
+                print(
+                    "Error: could not find the separated Demucs output folder.",
+                    file=sys.stderr,
+                )
+                return 1
 
-    return {
-        "Bass": bass,
-        "Perc": perc,
-        "Piano*": piano,
-        "Vocal*": vocal,
-        "times": librosa.frames_to_time(
-            np.arange(magnitude.shape[1]), sr=sr, hop_length=hop_length
-        ),
-    }
+            separated_directory = song_directories[0]
+            staged_directory = temporary_path / "ready"
+            staged_directory.mkdir()
 
+            for stem, output_name in STEMS.items():
+                source_file = separated_directory / f"{stem}.mp3"
+                if not source_file.is_file():
+                    print(
+                        f"Error: Demucs did not create {source_file.name}.",
+                        file=sys.stderr,
+                    )
+                    return 1
+                shutil.copyfile(source_file, staged_directory / output_name)
 
-def play_visualizer(features: dict[str, np.ndarray], title: str) -> None:
-    names = ["Bass", "Perc", "Piano*", "Vocal*"]
-    fig, ax = plt.subplots(figsize=(10, 5))
-    fig.canvas.manager.set_window_title("SP - Audio Part Visualizer")
-    ax.set_title(title)
-    ax.set_ylim(0, 1)
-    ax.set_ylabel("Estimated intensity")
-    ax.set_xlabel("Time")
-    ax.grid(alpha=0.2)
-    lines = {
-        name: ax.plot([], [], label=name, linewidth=1.5)[0]
-        for name in names
-    }
-    ax.legend(loc="upper right")
-    times = features["times"]
+            # Publish the complete set only after all four files were prepared.
+            for output_name in STEMS.values():
+                destination = output_dir / output_name
+                if destination.exists():
+                    print(
+                        f"Error: output appeared during processing: {destination}",
+                        file=sys.stderr,
+                    )
+                    return 2
+                os.replace(staged_directory / output_name, destination)
 
-    def update(_frame: int):
-        for name, line in lines.items():
-            line.set_data(times, features[name])
-        ax.set_xlim(0, max(float(times[-1]), 1.0))
-        return tuple(lines.values())
+    except FileNotFoundError as exc:
+        print(f"Error: could not start Demucs: {exc}", file=sys.stderr)
+        print(
+            "Install dependencies with: "
+            "python -m pip install -r requirements.txt",
+            file=sys.stderr,
+        )
+        return 1
+    except OSError as exc:
+        print(f"File error: {exc}", file=sys.stderr)
+        return 1
 
-    animation = FuncAnimation(fig, update, interval=50, blit=False, cache_frame_data=False)
-    plt.show()
+    print("Completed:")
+    for output_name in STEMS.values():
+        print(f"  {output_dir / output_name}")
+    print("The input MP3 was not modified.")
+    return 0
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Read-only audio part visualizer prototype")
-    parser.add_argument("file", type=Path, help="Input .mp4, .webm, .wav, or .mp3 file")
-    args = parser.parse_args()
-
-    path = args.file.expanduser().resolve()
-    if not path.is_file():
-        parser.error(f"File does not exist: {path}")
-
-    try:
-        audio, sr = load_audio_read_only(path)
-        features = analyze(audio, sr)
-        play_visualizer(features, path.name)
-    except (ValueError, RuntimeError, OSError) as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
-    return 0
+    args = parse_args()
+    return separate_mp3(
+        args.input,
+        args.output_dir,
+        args.device,
+        args.mp3_bitrate,
+    )
 
 
 if __name__ == "__main__":
