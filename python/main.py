@@ -19,6 +19,8 @@ import numpy as np
 import soundfile as sf
 import librosa
 import matplotlib.pyplot as plt
+
+plt.rcParams["font.family"] = ["Yu Gothic", "Meiryo", "sans-serif"]
 from matplotlib.animation import FuncAnimation
 
 AUDIO_EXTENSIONS = {".wav", ".mp3"}
